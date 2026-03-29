@@ -7,7 +7,12 @@
     "compile:contract": "node scripts/deploy-sepolia.mjs --dry-run"
   },
   "devDependencies": {
+    "circom": "^0.5.46",
+    "circom2": "^0.2.22",
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
     "ethers": "^6.13.4",
+    "snarkjs": "^0.7.5",
     "solc": "0.8.20"
   }
 }

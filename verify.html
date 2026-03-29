@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Credential Verification — Hydration Compliance Suite</title>
+  <title>Credential Verification — Did you Shower ?</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -276,7 +276,7 @@
   <header class="site-header">
     <div class="crest">🌊</div>
     <div class="title-block">
-      <h1>Hydration Compliance Suite</h1>
+      <h1>Did you Shower ?</h1>
       <p>Credential Verification Portal</p>
     </div>
     <span class="badge">ECDSA · P-256 · SHA-256</span>
@@ -414,7 +414,7 @@
       <div class="paste-prompt">
         <div class="big-icon">🔍</div>
         <h2>Verify a credential</h2>
-        <p>Scan the QR code from the Hydration Compliance Suite app — or paste a verification token or attestation JSON below.</p>
+        <p>Scan the QR code from the Did you Shower ? app — or paste a verification token or attestation JSON below.</p>
       </div>
 
       <div class="input-card">
@@ -460,7 +460,7 @@
 
   <footer class="site-footer">
     Cryptographic verification runs entirely in your browser — no data transmitted. ·
-    <a href="./index.html">← Back to Hydration Compliance Suite</a>
+    <a href="./index.html">← Back to Did you Shower ?</a>
   </footer>
 
   <script src="./chain-config.js"></script>
@@ -523,8 +523,10 @@
       }
 
       H.verifyAttestation(att).then(function (res) {
+        const isPresentation = att._isPresentation;
         const body    = att.body    || {};
-        const cert    = body.certificate || {};
+        // Slim presentation has fields at top level; full attestation nests under body.certificate
+        const cert    = isPresentation ? body : (body.certificate || {});
         const signing = att.signing || {};
         const sig     = String(signing.signature || "");
         const isSoft  = sig.indexOf("soft.") === 0;
@@ -573,16 +575,17 @@
           wEl.appendChild(tag);
         }
 
-        // ZK tag
+        // ZK tag — presentations use body.zkCommitment; full attestations use body.zk.commitment
         const zkEl = document.getElementById("credZk");
         if (zkEl) {
-          if (body.zk && body.zk.commitment) {
-            const zkCheck = res.results.find(function (r) { return r.name.indexOf("Binding") >= 0; });
+          const zkVal = (body.zk && body.zk.commitment) || body.zkCommitment || null;
+          if (zkVal) {
+            const zkCheck = res.results.find(function (r) { return r.name.indexOf("Binding") >= 0 || r.name.indexOf("ZK") >= 0; });
             const zkOk    = zkCheck && zkCheck.pass;
             zkEl.innerHTML =
               '<span class="cf-tag ' + (zkOk ? "zk-ok" : "session") + '">' +
-              escapeHtml(shortHash(body.zk.commitment, 24)) +
-              (zkOk ? " ✓" : " ?") + "</span>";
+              escapeHtml(shortHash(zkVal, 24)) +
+              (zkOk ? " ✓" : " (display only)") + "</span>";
           } else {
             zkEl.innerHTML = '<span class="cf-tag zk-none">Not present</span>';
           }
@@ -712,32 +715,33 @@
       }
     } catch (_) {}
 
-    // ── Auto-verify from URL fragment ─────────────────────
+    // ── Auto-verify from URL fragment ────────────────────
     try {
       const h = location.hash;
       if (h && h.length > 1) {
         const raw = h.slice(1);
         let token = null;
-        if (raw.indexOf("t=") === 0) {
-          token = decodeURIComponent(raw.slice(2));
-        } else if (raw.indexOf("z1.") === 0 || raw.indexOf("j1.") === 0) {
+        if (raw.indexOf("t=") === 0) token = decodeURIComponent(raw.slice(2));
+        else if (raw.indexOf("p1.") === 0 || raw.indexOf("p1j.") === 0 ||
+                 raw.indexOf("z1.") === 0 || raw.indexOf("j1.") === 0) {
           token = decodeURIComponent(raw);
         }
         if (token) {
           showState("stateLoading");
           void verifyToken(token);
-        } else {
-          showState("statePaste");
-        }
-      } else {
-        const pending = sessionStorage.getItem("hydration_pending_verify");
-        if (pending) {
-          sessionStorage.removeItem("hydration_pending_verify");
-          verifyJson(pending);
-        } else {
-          showState("statePaste");
+          return;
         }
       }
+
+      // Legacy sessionStorage redirect
+      const pending = sessionStorage.getItem("hydration_pending_verify");
+      if (pending) {
+        sessionStorage.removeItem("hydration_pending_verify");
+        verifyJson(pending);
+        return;
+      }
+
+      showState("statePaste");
     } catch (_) {
       showState("statePaste");
     }

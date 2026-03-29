@@ -154,15 +154,16 @@
     if (!attestation || !attestation.body || !attestation.signing) {
       return {
         ok: false,
-        results: [
-          {
-            name: "Structure",
-            pass: false,
-            detail: "Expected { body, signing } (exported attestation.json)",
-          },
-        ],
+        results: [{ name: "Structure", pass: false, detail: "Expected { body, signing }" }],
       };
     }
+
+    // Slim presentation credential (from QR scan)
+    if (attestation._isPresentation) {
+      return verifyPresentation(attestation);
+    }
+
+    // Full attestation (from exported JSON)
     const body = attestation.body;
     const signing = attestation.signing;
     const results = [];
@@ -170,11 +171,7 @@
     if (body.zk) {
       results.push(await verifyBindingCommitment(body.zk));
     } else {
-      results.push({
-        name: "Binding commitment (SHA-256)",
-        pass: false,
-        detail: "No body.zk — export may be old or incomplete",
-      });
+      results.push({ name: "Binding commitment (SHA-256)", pass: false, detail: "No body.zk — export may be old or incomplete" });
     }
 
     results.push(await verifyAttestationDigest(body, signing));
@@ -184,6 +181,70 @@
 
     const critical = results.filter((r) => r.name.indexOf("WebAuthn") === -1 && r.name.indexOf("WebGPU") === -1);
     const ok = critical.every((r) => r.pass);
+    return { ok, results };
+  }
+
+  async function verifyPresentation(pres) {
+    const body = pres.body;
+    const signing = pres.signing;
+    const results = [];
+
+    // 1. Schema check
+    results.push({
+      name: "Credential schema",
+      pass: body.schema === "yhack.dryness.presentation/v1",
+      detail: body.schema === "yhack.dryness.presentation/v1"
+        ? "yhack.dryness.presentation/v1"
+        : "Unexpected schema: " + (body.schema || "missing"),
+    });
+
+    // 2. ZK commitment display (no nonce in presentation — just show it was present)
+    results.push({
+      name: "ZK Binding Commitment",
+      pass: Boolean(body.zkCommitment),
+      detail: body.zkCommitment
+        ? "Present: " + body.zkCommitment.slice(0, 24) + "… (full verification requires exported JSON)"
+        : "Not present in this credential",
+    });
+
+    // 3. ECDSA signature over presentation body
+    const sig = String(signing.signature || "");
+    if (sig.indexOf("soft.") === 0) {
+      results.push({ name: "ECDSA Signature (P-256)", pass: true, detail: "Soft mode — no asymmetric key material" });
+    } else if (!signing.publicJwk || !global.crypto || !global.crypto.subtle) {
+      results.push({ name: "ECDSA Signature (P-256)", pass: false, detail: "Missing public JWK or Web Crypto" });
+    } else {
+      try {
+        const canonical = canonicalize(body);
+        const pubKey = await global.crypto.subtle.importKey(
+          "jwk", signing.publicJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]
+        );
+        const ok = await global.crypto.subtle.verify(
+          { name: "ECDSA", hash: "SHA-256" },
+          pubKey,
+          base64UrlToUint8(sig),
+          encoder.encode(canonical)
+        );
+        results.push({
+          name: "ECDSA Signature (P-256)",
+          pass: ok,
+          detail: ok ? "Signature valid over canonical presentation body" : "Signature invalid",
+        });
+      } catch (e) {
+        results.push({ name: "ECDSA Signature (P-256)", pass: false, detail: (e && e.message) || String(e) });
+      }
+    }
+
+    // 4. Witness tier
+    results.push({
+      name: "Witness tier",
+      pass: true,
+      detail: body.witnessTier === "device_bound"
+        ? "Device-bound — WebAuthn assertion was completed on the issuing device"
+        : "Session-scoped — no hardware authenticator",
+    });
+
+    const ok = results.filter((r) => r.name !== "ZK Binding Commitment").every((r) => r.pass);
     return { ok, results };
   }
 
@@ -250,14 +311,28 @@
 
   async function decodeVerificationToken(token) {
     const t = String(token || "").trim();
-    if (!t) {
-      throw new Error("Empty token");
+    if (!t) throw new Error("Empty token");
+
+    // p1. — deflate-compressed slim presentation (v2 bundle)
+    if (t.indexOf("p1.") === 0) {
+      if (typeof DecompressionStream === "undefined") throw new Error("DecompressionStream unavailable");
+      const raw = base64UrlToUint8(t.slice(3));
+      const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate"));
+      const buf = await new Response(stream).arrayBuffer();
+      const bundle = JSON.parse(new TextDecoder().decode(buf));
+      return presentationFromBundle(bundle);
     }
+
+    // p1j. — uncompressed slim presentation fallback
+    if (t.indexOf("p1j.") === 0) {
+      const bundle = JSON.parse(new TextDecoder().decode(base64UrlToUint8(t.slice(4))));
+      return presentationFromBundle(bundle);
+    }
+
+    // Legacy full-attestation tokens
     let json;
     if (t.indexOf("z1.") === 0) {
-      if (typeof DecompressionStream === "undefined") {
-        throw new Error("This browser cannot inflate z1 tokens (deflate)");
-      }
+      if (typeof DecompressionStream === "undefined") throw new Error("DecompressionStream unavailable");
       const raw = base64UrlToUint8(t.slice(3));
       const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate"));
       const buf = await new Response(stream).arrayBuffer();
@@ -265,10 +340,27 @@
     } else if (t.indexOf("j1.") === 0) {
       json = new TextDecoder().decode(base64UrlToUint8(t.slice(3)));
     } else {
-      throw new Error("Unknown token prefix (expected z1. or j1.)");
+      throw new Error("Unknown token prefix");
     }
     const bundle = JSON.parse(json);
     return attestationFromVerificationBundle(bundle);
+  }
+
+  // Convert a v2 presentation bundle into a verifiable object
+  async function presentationFromBundle(bundle) {
+    if (!bundle || bundle.v !== 2 || !bundle.b) throw new Error("Invalid presentation bundle");
+    const digest = await sha256Base64Url(canonicalize(bundle.b));
+    return {
+      _isPresentation: true,
+      body: bundle.b,
+      signing: {
+        signature: bundle.s,
+        publicJwk: bundle.j,
+        keyId: bundle.j ? (await sha256Base64Url(canonicalize(bundle.j))).slice(0, 22) : "soft-sign",
+        algorithm: "ECDSA-P256-SHA256",
+        presentationDigest: digest,
+      },
+    };
   }
 
   function buildVerifyFragmentUrl(verifyPageUrl, token) {

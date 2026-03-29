@@ -1006,52 +1006,30 @@
     currentProofBlock = findProofBlock(activeAttestation.signing.attestationDigest);
     syncChainStatus();
     const body = activeAttestation.body;
+    // Build a slim, always-scannable QR URL.
+    // The full attestation is too large for a QR code (~3-8KB after ZK/GPU/WebAuthn fields).
+    // Instead the QR encodes a short verify URL with just the seal number as a query param.
+    // verify.html picks it up and auto-loads the attestation from sessionStorage (same-device)
+    // or prompts the user to paste the JSON (cross-device).
+    const isLocal = location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname === "";
+    const publicBase = isLocal ? "https://yhack-tide-pool.vercel.app" : location.origin;
     let verifyPageHref = "verify.html";
     try {
-      verifyPageHref = new URL("verify.html", location.href).href;
+      verifyPageHref = new URL("verify.html", publicBase + "/").href;
     } catch (_) {}
+
     void (async () => {
-      let qrPayload = "";
       try {
-        if (window.HydrationAttestationVerify && window.HydrationAttestationVerify.encodeVerificationBundle) {
-          const token = await window.HydrationAttestationVerify.encodeVerificationBundle(activeAttestation);
-          qrPayload =
-            window.HydrationAttestationVerify.buildVerifyFragmentUrl(verifyPageHref, token);
-        }
+        const keys = await ensureSigningKeys();
+        const token = await buildPresentationToken(activeCertificate, activeAttestation, keys);
+        const qrUrl = verifyPageHref + "#t=" + encodeURIComponent(token);
+        await renderQrImg(qrOk, qrUrl, { width: 240, errorCorrectionLevel: "L" });
       } catch (err) {
-        console.warn("verification QR bundle failed", err);
-      }
-      if (qrPayload) {
+        console.warn("presentation QR failed", err);
         try {
-          await renderQrImg(qrOk, qrPayload, { width: 240, errorCorrectionLevel: "M" });
-        } catch (err) {
-          console.warn("QR render failed", err);
-          setQr(qrOk, {
-            verdict: "certified_not_showered",
-            sealNumber: activeCertificate.sealNumber,
-            operatorAlias: activeCertificate.operatorAlias,
-            digest: activeAttestation.signing.attestationDigest,
-            council: activeCertificate.councilSummary,
-            modelScore: activeCertificate.modelScore,
-            witness: body.biometric ? "device_bound" : "session_only",
-            commitment: body.zk && body.zk.commitment ? shortHash(body.zk.commitment, 16) : null,
-            gpuFingerprint: body.gpu && body.gpu.hash ? body.gpu.hash.slice(0, 16) : null,
-            verifyPage: verifyPageHref,
-          });
-        }
-      } else {
-        setQr(qrOk, {
-          verdict: "certified_not_showered",
-          sealNumber: activeCertificate.sealNumber,
-          operatorAlias: activeCertificate.operatorAlias,
-          digest: activeAttestation.signing.attestationDigest,
-          council: activeCertificate.councilSummary,
-          modelScore: activeCertificate.modelScore,
-          witness: body.biometric ? "device_bound" : "session_only",
-          commitment: body.zk && body.zk.commitment ? shortHash(body.zk.commitment, 16) : null,
-          gpuFingerprint: body.gpu && body.gpu.hash ? body.gpu.hash.slice(0, 16) : null,
-          verifyPage: verifyPageHref,
-        });
+          // Ultimate fallback: just the verify URL with no token
+          await renderQrImg(qrOk, verifyPageHref, { width: 240, errorCorrectionLevel: "L" });
+        } catch (_) {}
       }
     })();
     if (certWitness) {
@@ -1078,6 +1056,52 @@
         ? "Authenticator: WebAuthn assertion bound to this device (user-present verification)."
         : "Authenticator: not completed — attestation is session-scoped only.";
     }
+  }
+
+  async function buildPresentationToken(certificate, attestation, keys) {
+    // A slim credential — only the display fields — signed separately with the same key.
+    // Strips: GPU hash, WebAuthn bytes, ZK nonce, council vote details, ledger/runtime.
+    // Typical size before compression: ~350 bytes. After deflate + base64url: ~300 chars.
+    const body = attestation.body;
+    const presentationBody = {
+      schema: "yhack.dryness.presentation/v1",
+      sealNumber: certificate.sealNumber,
+      issuedAtIso: certificate.issuedAtIso,
+      operatorAlias: certificate.operatorAlias,
+      tideLevel: certificate.tideLevel,
+      councilSummary: certificate.councilSummary,
+      modelScore: certificate.modelScore,
+      witnessTier: body.witnessTier || "session_only",
+      zkCommitment: (body.zk && body.zk.commitment) ? body.zk.commitment : null,
+      fullDigest: attestation.signing.attestationDigest,
+    };
+
+    const canonical = canonicalize(presentationBody);
+    let signature = "soft." + await sha256Base64Url(canonical);
+
+    if (keys && keys.privateKey && window.crypto && window.crypto.subtle) {
+      const sig = await window.crypto.subtle.sign(
+        { name: "ECDSA", hash: "SHA-256" },
+        keys.privateKey,
+        encoder.encode(canonical)
+      );
+      signature = toBase64Url(sig);
+    }
+
+    const bundle = {
+      v: 2,
+      b: presentationBody,
+      s: signature,
+      j: keys ? keys.publicJwk : null,
+    };
+
+    const json = JSON.stringify(bundle);
+    if (typeof CompressionStream !== "undefined") {
+      const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("deflate"));
+      const buf = await new Response(stream).arrayBuffer();
+      return "p1." + toBase64Url(buf);
+    }
+    return "p1j." + toBase64Url(encoder.encode(json));
   }
 
   function downloadCertificateFile() {
@@ -1161,7 +1185,7 @@
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="860" viewBox="0 0 1200 860" role="img" aria-labelledby="svgTitle svgDesc">
-  <title id="svgTitle">Hydration Compliance Suite — Credential Attestation</title>
+  <title id="svgTitle">Did you Shower ? — Credential Attestation</title>
   <desc id="svgDesc">ECDSA-P256-SHA256 signed attestation. Verify at ${escapeXml(verifyUrl)}</desc>
   <defs>
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1192,7 +1216,7 @@
   <rect x="24" y="148" width="1152" height="8" fill="url(#stripe)"/>
 
   <!-- Header text -->
-  <text x="64" y="72" font-family="Inter, Nunito, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="5" fill="rgba(255,255,255,0.55)">HYDRATION COMPLIANCE SUITE · CREDENTIAL ATTESTATION</text>
+  <text x="64" y="72" font-family="Inter, Nunito, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="5" fill="rgba(255,255,255,0.55)">DID YOU SHOWER ? · CREDENTIAL ATTESTATION</text>
   <text x="64" y="122" font-family="Inter, Nunito, Arial, sans-serif" font-size="38" font-weight="800" fill="#ffffff">CERTIFIED NOT SHOWERED</text>
 
   <!-- Seal badge (top-right circle) -->
