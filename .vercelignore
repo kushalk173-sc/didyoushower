@@ -1,0 +1,6 @@
+node_modules
+.env
+.env.*
+.http-server.pid
+out
+cache

@@ -1,0 +1,9 @@
+.http-server.pid
+.vercel
+node_modules
+.env
+.env.*
+out
+cache
+
+.vercel
